@@ -180,6 +180,28 @@
 
         let abortController = null;
 
+        // --- Helpers for Building WSC (Wi-Fi Simple Config) Binary ---
+
+        // Appends a TLV (Type-Length-Value) block to a regular array
+        function appendTLV(buffer, type, valueArray) {
+            // Type (2 bytes, Big Endian)
+            buffer.push((type >> 8) & 0xFF);
+            buffer.push(type & 0xFF);
+            
+            // Length (2 bytes, Big Endian)
+            const len = valueArray.length;
+            buffer.push((len >> 8) & 0xFF);
+            buffer.push(len & 0xFF);
+            
+            // Value
+            valueArray.forEach(v => buffer.push(v));
+        }
+
+        // Helper to convert number to 2-byte array
+        function toBytes(num) {
+            return [(num >> 8) & 0xFF, num & 0xFF];
+        }
+
         // Write Function
         writeBtn.addEventListener('click', async () => {
             if (!ssidInput.value) {
@@ -187,27 +209,78 @@
                 return;
             }
 
-            // Construct Wi-Fi config string (MECARD/ZXing format commonly used for QR/NFC)
+            // 1. Prepare Text Record (Fallback / NFC Tools format)
             // Format: WIFI:S:SSID;T:Type;P:Password;H:Hidden;;
             let wifiString = `WIFI:S:${ssidInput.value};`;
-            
-            const type = securitySelect.value;
-            wifiString += `T:${type};`;
-
-            if (type !== 'nopass') {
+            const typeStr = securitySelect.value;
+            wifiString += `T:${typeStr};`;
+            if (typeStr !== 'nopass') {
                 wifiString += `P:${passwordInput.value};`;
             }
-
             if (hiddenCheck.checked) {
                 wifiString += `H:true;`;
             }
-            
             wifiString += `;`;
 
-            startScanning(wifiString);
+
+            // 2. Prepare MIME Record (Binary WSC - Standard for Android System)
+            const ssid = ssidInput.value;
+            const password = passwordInput.value;
+            const security = securitySelect.value;
+            const encoder = new TextEncoder();
+            
+            const ssidBytes = encoder.encode(ssid);
+            const keyBytes = encoder.encode(password);
+            
+            let authType, encType;
+            // Map UI selection to WSC Constants
+            // Auth: Open=0x0001, WPAPSK=0x0002, Shared=0x0004, WPA=0x0008, WPA2=0x0010, WPA2PSK=0x0020
+            // Enc:  None=0x0001, WEP=0x0002, TKIP=0x0004, AES=0x0008
+            
+            if (security === 'WPA') {
+                authType = 0x0020; // WPA2PSK
+                encType = 0x0008; // AES
+            } else if (security === 'WEP') {
+                authType = 0x0001; // Open (System often handles WEP auth auto, or use Shared 0x0004)
+                encType = 0x0002; // WEP
+            } else {
+                authType = 0x0001; // Open
+                encType = 0x0001; // None
+            }
+
+            // Build inner attributes
+            const attributes = [];
+            
+            // Network Index (0x1026) - usually 1
+            appendTLV(attributes, 0x1026, [1]);
+            
+            // SSID (0x1045)
+            appendTLV(attributes, 0x1045, ssidBytes);
+            
+            // Auth Type (0x1003)
+            appendTLV(attributes, 0x1003, toBytes(authType));
+            
+            // Encryption Type (0x100F)
+            appendTLV(attributes, 0x100F, toBytes(encType));
+            
+            // Network Key (0x1027)
+            if (security !== 'nopass' && password.length > 0) {
+                appendTLV(attributes, 0x1027, keyBytes);
+            }
+            
+            // MAC Address (0x1020) - Optional, using dummy FF:.. if needed, but often omitted safely.
+            
+            // Wrap in Credential (0x100E)
+            const wscPayload = [];
+            appendTLV(wscPayload, 0x100E, attributes);
+            
+            const binaryData = new Uint8Array(wscPayload);
+
+
+            startScanning(binaryData, wifiString);
         });
 
-        async function startScanning(dataToWrite) {
+        async function startScanning(wscData, textData) {
             try {
                 abortController = new AbortController();
                 const ndef = new NDEFReader();
@@ -216,21 +289,31 @@
                 scanOverlay.classList.remove('hidden');
                 scanOverlay.classList.add('flex');
 
+                // We write two records:
+                // 1. The MIME record (WSC) - Preferred by Android System for "Tap to Connect"
+                // 2. The Text record (URI) - Fallback for older apps or NFC Tools
+                
                 await ndef.write({
-                    records: [{
-                        recordType: "text",
-                        data: dataToWrite
-                    }]
+                    records: [
+                        {
+                            recordType: "mime",
+                            mediaType: "application/vnd.wfa.wsc",
+                            data: wscData
+                        },
+                        {
+                            recordType: "text",
+                            data: textData
+                        }
+                    ]
                 }, { signal: abortController.signal });
 
                 // Success
                 hideOverlay();
-                showStatus('Successfully wrote Wi-Fi credentials to tag!', 'success');
+                showStatus('Successfully wrote Wi-Fi credentials!', 'success');
 
             } catch (error) {
                 hideOverlay();
                 if (error.name === 'AbortError') {
-                    // User cancelled, do nothing or simple log
                     showStatus('Write cancelled.', 'neutral');
                 } else if (error.name === 'NotAllowedError') {
                     showStatus('NFC permission denied. Please allow NFC access.', 'error');
